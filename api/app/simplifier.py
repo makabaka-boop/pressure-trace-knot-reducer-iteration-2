@@ -17,6 +17,23 @@ Two solvers share the same DAG (visibility graph) machinery:
   original index attaining that segment's worst deviation (a
   re-checkable witness).
 
+Both modes additionally accept an optional *directional* configuration
+(two positive integer bounds, one for samples above the interpolated
+chord and one for samples below it):
+
+* :func:`simplify_directional` -- adjudicates every candidate segment
+  with the two bounds (a point consumes ``deviation / bound`` of its
+  own side); the shortest-path/lexicographic tie-breaks are unchanged.
+
+* :func:`simplify_with_budget_directional` -- minimises the *common*
+  multiplier of the two bounds for which every deviation fits, again
+  followed by fewest segments and lexicographic order.
+
+The directional modes build the same candidate-segment cost matrices
+and feed them into the same reachability/shortest-path/lexicographic
+machinery as the legacy modes; only the per-edge cost changes (a
+side-aware rational ratio instead of an absolute deviation).
+
 Every comparison is performed with integer cross multiplication
 (:class:`fractions.Fraction` reduces the result exactly); no floating
 point arithmetic is involved.
@@ -26,6 +43,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from fractions import Fraction
+
+# Direction of a sample relative to its interpolated chord.
+ABOVE = "above"  # sample lies strictly above the interpolation line
+BELOW = "below"  # sample lies strictly below the interpolation line
+ON_LINE = "on"  # sample lies exactly on the interpolation line
 
 
 # ---------------------------------------------------------------------------
@@ -350,3 +372,249 @@ def simplify_with_budget(
         max_error=optimal_error,
         segments=segments,
     )
+
+
+# ---------------------------------------------------------------------------
+# Directional error mode (separate positive bounds above / below the chord)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DirectionalBounds:
+    """Positive integer deviation bounds for the two error directions.
+
+    A sample strictly *above* its interpolated chord must not deviate by
+    more than ``above`` (scaled by the common multiplier in budget
+    mode); a sample strictly *below* it must not deviate by more than
+    ``below``.
+    """
+
+    above: int
+    below: int
+
+
+@dataclass(frozen=True)
+class Witness:
+    """An original point attaining a worst deviation, with its direction."""
+
+    index: int
+    #: One of :data:`ABOVE`, :data:`BELOW`, :data:`ON_LINE`.
+    direction: str
+
+
+@dataclass(frozen=True)
+class DirectionalSegmentReport:
+    """Worst-ratio report for one retained segment (directional mode)."""
+
+    start: int
+    end: int
+    #: Segment bottleneck: the largest ``deviation / side-bound`` ratio.
+    ratio: Fraction
+    #: Smallest intermediate index attaining ``ratio`` with its direction;
+    #: ``None`` when the segment connects adjacent samples.
+    witness: Witness | None
+
+
+@dataclass(frozen=True)
+class DirectionalSolution:
+    """Result of a directional solver.
+
+    ``worst_ratio`` is ``1`` for threshold adjudication (every chosen
+    segment fits at multiplier 1) and the minimised common multiplier
+    for the budget solver.  ``witness`` is the original point attaining
+    that worst ratio over the whole solution (smallest index on a tie,
+    direction retained), or ``None`` when no segment has an
+    intermediate point.
+    """
+
+    indices: list[int]
+    worst_ratio: Fraction
+    segments: list[DirectionalSegmentReport]
+    witness: Witness | None
+
+    @property
+    def segment_count(self) -> int:
+        return len(self.indices) - 1
+
+
+def _validate_directional_bounds(
+    above: int,
+    below: int,
+) -> DirectionalBounds:
+    """Check that both directional limits are genuine positive ints."""
+    for name, value in (("above", above), ("below", below)):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"{name} bound must be a positive integer")
+    return DirectionalBounds(above=above, below=below)
+
+
+def _edge_directional_costs(
+    times: list[int],
+    values: list[int],
+    bounds: DirectionalBounds,
+) -> tuple[list[list[Fraction | None]], list[list[Witness | None]]]:
+    """Worst side-aware ratio and witness for every possible segment.
+
+    For each intermediate sample the ratio is its deviation divided by
+    the bound of the side it lies on::
+
+        above: deviation / bounds.above
+        below: deviation / bounds.below
+        on:    0
+
+    ``costs[i][j]`` is the maximum ratio on the segment (zero for
+    adjacent nodes) and ``witnesses[i][j]`` is the smallest
+    intermediate index attaining it together with that point's
+    direction.  Everything is a :class:`Fraction` (integer cross
+    multiplication on comparison), so boundary equality and non-integer
+    multipliers are exact.
+    """
+    n = len(times)
+    costs: list[list[Fraction | None]] = [[None] * n for _ in range(n)]
+    witnesses: list[list[Witness | None]] = [[None] * n for _ in range(n)]
+    for i in range(n - 1):
+        t_i = times[i]
+        v_i = values[i]
+        for j in range(i + 1, n):
+            dt = times[j] - t_i
+            dv = values[j] - v_i
+            worst = Fraction(0)
+            witness: Witness | None = None
+            for k in range(i + 1, j):
+                signed = (values[k] - v_i) * dt - dv * (times[k] - t_i)
+                if signed > 0:
+                    ratio = Fraction(signed, dt * bounds.above)
+                    direction = ABOVE
+                elif signed < 0:
+                    ratio = Fraction(-signed, dt * bounds.below)
+                    direction = BELOW
+                else:
+                    ratio = Fraction(0)
+                    direction = ON_LINE
+                # Strict comparison keeps the first (smallest) index on
+                # an exact ratio tie, even when the tied directions
+                # differ (above-vs-below ties go to the smaller index).
+                if witness is None or ratio > worst:
+                    worst = ratio
+                    witness = Witness(index=k, direction=direction)
+            costs[i][j] = worst
+            witnesses[i][j] = witness
+    return costs, witnesses
+
+
+def _build_directional_solution(
+    indices: list[int],
+    costs: list[list[Fraction | None]],
+    witnesses: list[list[Witness | None]],
+) -> DirectionalSolution:
+    """Assemble segment reports and the global witness for one path.
+
+    The global witness is the smallest original index attaining the
+    path-wide worst ratio (segments are walked in order, and the
+    per-segment witnesses already resolve within-segment ties by
+    smallest index); its direction is reported with it.
+    """
+    segments: list[DirectionalSegmentReport] = []
+    worst_ratio = Fraction(0)
+    global_witness: Witness | None = None
+    for a, b in zip(indices, indices[1:]):
+        ratio = costs[a][b]
+        witness = witnesses[a][b]
+        segments.append(
+            DirectionalSegmentReport(
+                start=a, end=b, ratio=ratio, witness=witness
+            )
+        )
+        # Promote on a strictly larger ratio; the first segment (in path
+        # order) attaining the final maximum carries the globally
+        # smallest attaining index.  Explicitly handling the very first
+        # witness preserves the zero-ratio (collinear, direction "on")
+        # point, matching the legacy budget witness convention.
+        if witness is not None and (
+            global_witness is None or ratio > worst_ratio
+        ):
+            worst_ratio = ratio
+            global_witness = witness
+    return DirectionalSolution(
+        indices=indices,
+        worst_ratio=worst_ratio,
+        segments=segments,
+        witness=global_witness,
+    )
+
+
+def simplify_directional(
+    times: list[int],
+    values: list[int],
+    above: int,
+    below: int,
+) -> DirectionalSolution:
+    """Fewest-segment polyline under two directional integer bounds.
+
+    A candidate segment is admissible when every intermediate sample
+    above the chord deviates by at most ``above`` and every one below
+    it by at most ``below`` (boundary equality is admissible).  Ties are
+    broken exactly as in the legacy mode: fewest segments, then the
+    lexicographically smallest index sequence.
+    """
+    n = len(times)
+    if n < 2:
+        raise ValueError("at least two samples are required")
+    bounds = _validate_directional_bounds(above, below)
+
+    costs, witnesses = _edge_directional_costs(times, values, bounds)
+    # Adjudication at multiplier 1: an edge fits iff its ratio <= 1.
+    reachable = _reachable_from_costs(costs, n, Fraction(1))
+    dist = _minimum_segments(reachable, n)
+    indices = _lexicographically_smallest_path(reachable, dist, n)
+    return _build_directional_solution(indices, costs, witnesses)
+
+
+def simplify_with_budget_directional(
+    times: list[int],
+    values: list[int],
+    budget: int,
+    above: int,
+    below: int,
+) -> DirectionalSolution:
+    """Minimise the common multiplier of the two directional bounds.
+
+    With multiplier ``m`` every above-chord deviation must fit in
+    ``m * above`` and every below-chord deviation in ``m * below``.  The
+    solver finds the smallest reduced rational ``m`` for which some path
+    of at most ``budget`` segments exists, then breaks ties by (1)
+    fewest segments at that multiplier and (2) lexicographically
+    smallest index sequence -- the same preference as
+    :func:`simplify_with_budget`.  The optimum must equal some edge
+    ratio, so the sorted distinct ratios are binary-searched with the
+    same feasibility DP, and the returned witness is the original point
+    attaining the worst multiplier together with its direction.
+    """
+    n = len(times)
+    if n < 2:
+        raise ValueError("at least two samples are required")
+    if not isinstance(budget, int) or isinstance(budget, bool) or not (
+        1 <= budget < n
+    ):
+        raise ValueError("budget must be an integer with 1 <= budget < len(points)")
+    bounds = _validate_directional_bounds(above, below)
+
+    costs, witnesses = _edge_directional_costs(times, values, bounds)
+
+    candidates = sorted(
+        {costs[i][j] for i in range(n - 1) for j in range(i + 1, n)}
+    )
+    lo, hi = 0, len(candidates) - 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _can_cover_within_budget(costs, n, budget, candidates[mid]):
+            hi = mid
+        else:
+            lo = mid + 1
+    optimal_multiplier = candidates[lo]
+
+    # Same reachable-path / shortest-path / lexicographic machinery.
+    reachable = _reachable_from_costs(costs, n, optimal_multiplier)
+    dist = _minimum_segments(reachable, n)
+    indices = _lexicographically_smallest_path(reachable, dist, n)
+    return _build_directional_solution(indices, costs, witnesses)

@@ -155,3 +155,122 @@ test('budget equal to point count is rejected with 422', async ({ page }) => {
   await expect(page.locator('.error')).toContainText('422');
   await expect(page.getByTestId('result-panel')).toHaveCount(0);
 });
+
+// Directional budget mode: asymmetric above/below bounds.  The flat
+// 0->6 chord has peaks above and valleys below; the minimised common
+// multiplier is an exact non-integer rational driven by the tight
+// "above" side, and the global witness (shared by table + SVG) is the
+// smallest attaining original point with its deviation direction.
+const DIRECTED_BUDGET_REQUEST = {
+  budget: 2,
+  directed_error: { above: 2, below: 5 },
+  points: [
+    { time: 0, value: 0 },
+    { time: 1, value: 0 },
+    { time: 2, value: 1 },
+    { time: 3, value: 0 },
+    { time: 4, value: -1 },
+    { time: 5, value: 0 },
+    { time: 6, value: 0 },
+  ],
+};
+
+test('directed budget: exact multiplier, direction column, shared witness', async ({
+  page,
+}) => {
+  await page.goto('/');
+  await page.getByText('段数预算模式（budget').click();
+  await page.locator('#json-input').fill(JSON.stringify(DIRECTED_BUDGET_REQUEST));
+  await page.getByRole('button', { name: '提交计算' }).click();
+
+  const panel = page.getByTestId('result-panel');
+  await expect(panel).toBeVisible();
+  await expect(panel.locator('.summary').first()).toContainText('方向界限 上 2 / 下 5');
+  // Non-integer minimised multiplier, exact rational text.
+  await expect(panel.getByTestId('max-error')).not.toHaveText(/^\d+$/);
+
+  // Global witness banner names the shared point and its direction
+  // (index 4 lies below its interpolated chord, driving the 3/10
+  // multiplier against the tight "below"-scaled bound).
+  const banner = panel.getByTestId('global-witness');
+  await expect(banner).toContainText('下标 4');
+  await expect(banner).toContainText('插值线下方');
+
+  // Direction column exists in the segment table and the single worst
+  // row is highlighted (same witness as the red SVG marker).
+  const segmentRows = panel.getByTestId('segment-table').locator('tbody tr');
+  const headerCells = panel.getByTestId('segment-table').locator('thead th');
+  await expect(headerCells).toHaveCount(6);
+  const worstRow = panel.locator('tr.worst-row');
+  await expect(worstRow).toHaveCount(1);
+  const worstCells = worstRow.locator('td');
+  await expect(worstCells.nth(4)).toHaveText('4');
+  await expect(worstCells.nth(5)).toContainText('线下方');
+
+  // Exactly one red marker (global witness) and one orange marker;
+  // the red label carries the above-direction glyph and shared index.
+  const svg = panel.locator('svg.chart');
+  await expect(svg.locator('g.marker-worst')).toHaveCount(1);
+  await expect(svg.locator('g.marker-segment')).toHaveCount(1);
+  const sharedIndex = (await banner.textContent()).match(/下标 (\d+)/)[1];
+  await expect(svg.locator('g.marker-worst .error-index')).toContainText(sharedIndex);
+
+  await expect(page.locator('.error')).toHaveCount(0);
+
+  // Switching modes clears the mismatched directional conclusion.
+  await page.getByText('阈值模式（tolerance').click();
+  await expect(panel).toHaveCount(0);
+});
+
+// Directional threshold mode adjudicates candidate segments with the
+// two bounds: tolerance and directed_error together must be rejected
+// by the API (422) and leave no stale conclusion on the page.
+test('directed threshold: bounds adjudicate; tolerance + config is 422', async ({
+  page,
+}) => {
+  await page.goto('/');
+
+  const ok = {
+    directed_error: { above: 5, below: 5 },
+    points: [
+      { time: 0, value: 0 },
+      { time: 1, value: 5 },
+      { time: 2, value: 0 },
+      { time: 3, value: 5 },
+      { time: 4, value: 0 },
+    ],
+  };
+  await page.locator('#json-input').fill(JSON.stringify(ok));
+  await page.getByRole('button', { name: '提交计算' }).click();
+  const panel = page.getByTestId('result-panel');
+  await expect(panel).toBeVisible();
+  await expect(panel.locator('.summary').first()).toContainText('裁决倍率 = 1');
+  await expect(panel.getByTestId('segment-table')).toBeVisible();
+  // table has the direction column even in threshold mode
+  await expect(
+    panel.getByTestId('segment-table').locator('thead th'),
+  ).toHaveCount(6);
+
+  // Supplying both the legacy tolerance and the new config is illegal.
+  const conflicting = { ...ok, tolerance: 5 };
+  await page.locator('#json-input').fill(JSON.stringify(conflicting));
+  await page.getByRole('button', { name: '提交计算' }).click();
+  await expect(page.locator('.error')).toContainText('422');
+  await expect(page.getByTestId('result-panel')).toHaveCount(0);
+});
+
+test('directed config with non-positive bound is rejected with 422', async ({
+  page,
+}) => {
+  await page.goto('/');
+  await page.getByText('段数预算模式（budget').click();
+  const bad = {
+    budget: 1,
+    directed_error: { above: 0, below: 2 },
+    points: DIRECTED_BUDGET_REQUEST.points,
+  };
+  await page.locator('#json-input').fill(JSON.stringify(bad));
+  await page.getByRole('button', { name: '提交计算' }).click();
+  await expect(page.locator('.error')).toContainText('422');
+  await expect(page.getByTestId('result-panel')).toHaveCount(0);
+});
